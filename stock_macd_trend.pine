@@ -171,10 +171,8 @@ if state == -1 and state[1] == -1 and useChand
 trailHitLong  = state ==  1 and not na(trailStop) and close < trailStop
 trailHitShort = state == -1 and not na(trailStop) and close > trailStop
 
-longExit  = exitMode == "Trend" ? (cHtf < sma200 or trailHitLong)
-                                : (cHtf < sma200 or macdLine < 0 or trailHitLong)
-shortExit = exitMode == "Trend" ? (cHtf > sma200 or trailHitShort)
-                                : (cHtf > sma200 or macdLine > 0 or trailHitShort)
+longExit  = exitMode == "Trend" ? (cHtf < sma200 or trailHitLong)  : (cHtf < sma200 or macdLine < 0 or trailHitLong)
+shortExit = exitMode == "Trend" ? (cHtf > sma200 or trailHitShort) : (cHtf > sma200 or macdLine > 0 or trailHitShort)
 
 if state ==  1 and longExit
     state     := 0
