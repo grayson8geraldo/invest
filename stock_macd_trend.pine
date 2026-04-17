@@ -50,8 +50,12 @@ rsiMax   = input.float(70, "Max RSI for entry",  group=grpStrat,
 volLen   = input.int(20,  "Volume MA length",    group=grpStrat)
 volMult  = input.float(1.0, "Min volume × MA",   group=grpStrat, step=0.1,
      tooltip="Объём сигнальной свечи должен быть не меньше volMult × средн. объёма.")
-allowShort = input.bool(false, "Allow SHORT signals", group=grpStrat,
-     tooltip="По умолчанию выключено: шорт акций требует маржи и невыгоден на длинном горизонте.")
+allowShort = input.bool(true, "Allow SHORT signals", group=grpStrat,
+     tooltip="Зеркальная логика к LONG. Требует маржинального счёта у брокера.")
+exitMode = input.string("Trend", "Exit mode", options=["Trend", "Strict"], group=grpStrat,
+     tooltip="Trend — держим позицию до разворота тренда (цена пробила SMA200 в обратную сторону). " +
+     "Strict — выход раньше, как только MACD пересекает ноль против позиции. " +
+     "Trend даёт максимум от тренда, Strict меньше просадку.")
 
 // ─── Inputs: Calculator ───────────────────────────────────────────────────
 grpCalc  = "Position Calculator"
@@ -87,25 +91,28 @@ volHtf  = request.security(syminfo.tickerid, htf, volume,                  looka
 cHtf    = request.security(syminfo.tickerid, htf, close,                   lookahead=barmerge.lookahead_off)
 
 // ─── Signal logic ─────────────────────────────────────────────────────────
-// Бычий тренд (обязательное условие для любой покупки)
 bullTrend = cHtf > sma200
+bearTrend = cHtf < sma200
 
-// Два типа входа:
-//  A) momentum breakout — MACD пересекает ноль снизу вверх
-//  B) pullback — MACD уже > 0 и цена откатилась к EMA50 и отскочила
-macdCrossUp   = ta.crossover(macdLine, 0)
-nearEma50     = cHtf >= ema50 * 0.99 and cHtf <= ema50 * 1.02
-pullbackBuy   = macdLine > 0 and nearEma50 and macdLine > signalLine and hist > hist[1]
+// LONG — два варианта входа:
+//  A) momentum breakout — MACD пересекает 0 снизу вверх
+//  B) pullback — MACD > 0, цена откатилась к EMA50 и гистограмма снова растёт
+macdCrossUp = ta.crossover(macdLine, 0)
+nearEma50   = cHtf >= ema50 * 0.99 and cHtf <= ema50 * 1.02
+pullbackBuy = macdLine > 0 and nearEma50 and macdLine > signalLine and hist > hist[1]
+
+// SHORT — симметрично:
+//  A) momentum breakdown — MACD пересекает 0 сверху вниз
+//  B) pullback — MACD < 0, цена подтянулась к EMA50 и гистограмма снова падает
+macdCrossDn   = ta.crossunder(macdLine, 0)
+pullbackShort = macdLine < 0 and nearEma50 and macdLine < signalLine and hist < hist[1]
 
 volOk = volHtf >= volMa * volMult
-rsiOk = rsiHtf < rsiMax
+rsiLongOk  = rsiHtf < rsiMax
+rsiShortOk = rsiHtf > (100 - rsiMax)
 
-longSignal  = bullTrend and (macdCrossUp or pullbackBuy) and volOk and rsiOk
-
-// Short (опционально, зеркально)
-bearTrend     = cHtf < sma200
-macdCrossDn   = ta.crossunder(macdLine, 0)
-shortSignal   = allowShort and bearTrend and macdCrossDn and volOk and rsiHtf > (100 - rsiMax)
+longSignal  = bullTrend and (macdCrossUp or pullbackBuy)   and volOk and rsiLongOk
+shortSignal = allowShort and bearTrend and (macdCrossDn or pullbackShort) and volOk and rsiShortOk
 
 // State machine: 1 = long, -1 = short, 0 = flat
 var int state = 0
@@ -113,10 +120,13 @@ if longSignal
     state := 1
 else if shortSignal
     state := -1
-// Выход из long — MACD ушёл под 0 или цена закрылась под SMA200
-if state == 1 and (macdLine < 0 or cHtf < sma200)
+
+// Выход: Trend — только по развороту SMA200, Strict — по MACD или SMA200
+longExit  = exitMode == "Trend" ? cHtf < sma200 : (macdLine < 0 or cHtf < sma200)
+shortExit = exitMode == "Trend" ? cHtf > sma200 : (macdLine > 0 or cHtf > sma200)
+if state ==  1 and longExit
     state := 0
-if state == -1 and (macdLine > 0 or cHtf > sma200)
+if state == -1 and shortExit
     state := 0
 
 newLong  = state ==  1 and state[1] !=  1
@@ -217,7 +227,11 @@ if newLong
 if newShort
     msg = "SHORT " + syminfo.ticker + "\n" +
           "Entry : $" + str.tostring(entryPx, format.mintick) + "\n" +
-          "Stop  : $" + str.tostring(shortStop, format.mintick) + "\n" +
+          "Stop  : $" + str.tostring(shortStop, format.mintick) +
+          " (+$" + str.tostring(stopDist, "#.##") + ")\n" +
+          "TP1   : $" + str.tostring(shortTP1, format.mintick) + " (1R, закрыть 1/3)\n" +
+          "TP2   : $" + str.tostring(shortTP2, format.mintick) + " (2R, закрыть 1/3, стоп в БУ)\n" +
+          "TP3   : $" + str.tostring(shortTP3, format.mintick) + " (3R, трейлинг)\n" +
           "Shares: " + str.tostring(shares) +
           " ($" + str.tostring(notional, "#.##") + ")"
     alert(msg, alert.freq_once_per_bar_close)
