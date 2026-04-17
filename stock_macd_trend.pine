@@ -1,72 +1,73 @@
 //@version=6
 // ============================================================================
-// Stock Medium-Term Trend — MACD + EMA200 + Volume — 4H / Daily
+// Stock Medium-Term Trend — MACD + SMA200 + RS + Chandelier — 4H / Daily
 // ============================================================================
-// Адаптация BTC-индикатора "MACD Zero 4H" под среднесрочную покупку акций.
+// Адаптация BTC-индикатора "MACD Zero 4H" под среднесрочную торговлю акциями.
 //
-// Ключевые отличия от крипто-версии:
-//   1. Основной ТФ — Daily (с опцией 4H для точного входа).
-//      Акции двигаются медленнее крипты, дневной ТФ даёт чище сигналы.
-//   2. Фильтр долгосрочного тренда — SMA200 (классика для акций, "линия Баффета").
-//      Торгуем ТОЛЬКО выше SMA200 — это убирает покупку в медвежьем рынке.
-//   3. Объёмный фильтр — сигнал валиден только при объёме выше средн. за 20 баров.
-//      У акций объём — ключевое подтверждение, у BTC он менее надёжен.
-//   4. RSI-фильтр перегретости — не входим если RSI(14) > 70 на сигнальной свече.
-//   5. Расчёт позиции — БЕЗ ПЛЕЧА (cash-аккаунт), в акциях (shares), не в BTC.
-//   6. Три уровня тейк-профита (1R, 2R, 3R) — акции трендят долго,
-//      частичная фиксация с переводом стопа в безубыток даёт лучший payoff.
-//   7. LONG-ONLY по умолчанию. Шорт акций = маржинальный счёт + комиссия за займ,
-//      и на медвежьем рынке лучше просто быть в кэше.
-//   8. Комиссия/проскальзывание учтены в расчёте риска (по умолчанию 0.1%).
-//
-// Как пользоваться:
-//   1. Откройте дневной график акции (AAPL, MSFT, NVDA и т.д.).
-//   2. Укажите размер счёта и риск на сделку в инпутах.
-//   3. Метка "BUY" появляется, когда совпали все условия:
-//        - цена выше SMA200 (бычий рынок);
-//        - MACD пересёк ноль снизу вверх ИЛИ уже выше нуля при откате к EMA50;
-//        - объём выше среднего;
-//        - RSI < 70.
-//   4. В правой верхней панели — готовые цифры: вход, стоп, 3 тейка, кол-во акций.
+// Отличия от крипто-версии:
+//   1. Основной ТФ — Daily (с опцией 4H).
+//   2. Фильтр тренда — SMA200 по тикеру.
+//   3. RELATIVE STRENGTH vs SPY — покупаем только то, что обгоняет рынок,
+//      шортим то, что отстаёт. Момент-фактор Jegadeesh-Titman.
+//   4. Объём + RSI + MACD — подтверждение входа.
+//   5. CHANDELIER EXIT — трейлинг-стоп по ATR от максимума/минимума позиции.
+//      Вместо фиксированных TP2/TP3 даёт "тянуть" позицию до разворота тренда.
+//   6. Расчёт позиции в акциях, без плеча, с учётом комиссии.
+//   7. LONG + SHORT, зеркально; переключатель Trend/Strict для выхода.
 // ----------------------------------------------------------------------------
-indicator("Stock Trend Buy — MACD+SMA200+Vol (Daily/4H)", overlay=true, max_labels_count=500)
+indicator("Stock Trend — MACD+SMA200+RS+Chandelier", overlay=true, max_labels_count=500)
 
 // ─── Inputs: Strategy ─────────────────────────────────────────────────────
 grpStrat = "Strategy"
 tfMode   = input.string("Daily", "Main timeframe", options=["Daily", "4H"], group=grpStrat,
-     tooltip="Daily — классический среднесрок, 2-8 недель в позиции. 4H — агрессивнее, 3-10 дней.")
+     tooltip="Daily — 2-8 недель в позиции. 4H — 3-10 дней.")
 fastLen  = input.int(12, "MACD fast",            group=grpStrat)
 slowLen  = input.int(26, "MACD slow",            group=grpStrat)
 sigLen   = input.int(9,  "MACD signal",          group=grpStrat)
 emaLen   = input.int(50,  "EMA pullback length", group=grpStrat)
-trendLen = input.int(200, "SMA trend filter",    group=grpStrat,
-     tooltip="Покупаем только если цена выше этой скользящей. Стандарт для акций — 200.")
+trendLen = input.int(200, "SMA trend filter",    group=grpStrat)
 atrLen   = input.int(14,  "ATR length",          group=grpStrat)
-atrMult  = input.float(2.5, "Stop = ATR ×",      group=grpStrat, step=0.1,
-     tooltip="Акции менее волатильны чем BTC, 2.5 ATR — разумный компромисс.")
+atrMult  = input.float(2.5, "Initial stop = ATR ×", group=grpStrat, step=0.1)
 rsiLen   = input.int(14,  "RSI length",          group=grpStrat)
-rsiMax   = input.float(70, "Max RSI for entry",  group=grpStrat,
-     tooltip="Не входим если RSI выше этого — избегаем покупок на пике эйфории.")
+rsiMax   = input.float(70, "Max RSI for long (min for short = 100-RSI)", group=grpStrat)
 volLen   = input.int(20,  "Volume MA length",    group=grpStrat)
-volMult  = input.float(1.0, "Min volume × MA",   group=grpStrat, step=0.1,
-     tooltip="Объём сигнальной свечи должен быть не меньше volMult × средн. объёма.")
-allowShort = input.bool(true, "Allow SHORT signals", group=grpStrat,
-     tooltip="Зеркальная логика к LONG. Требует маржинального счёта у брокера.")
+volMult  = input.float(1.0, "Min volume × MA",   group=grpStrat, step=0.1)
+allowShort = input.bool(true, "Allow SHORT signals", group=grpStrat)
 exitMode = input.string("Trend", "Exit mode", options=["Trend", "Strict"], group=grpStrat,
-     tooltip="Trend — держим позицию до разворота тренда (цена пробила SMA200 в обратную сторону). " +
-     "Strict — выход раньше, как только MACD пересекает ноль против позиции. " +
-     "Trend даёт максимум от тренда, Strict меньше просадку.")
+     tooltip="Trend — выход на развороте SMA200 или пробое трейлинг-стопа. " +
+     "Strict — дополнительно выходим при пересечении MACD через 0.")
+
+// ─── Inputs: Relative Strength ────────────────────────────────────────────
+grpRS    = "Relative Strength (momentum factor)"
+useRS    = input.bool(true, "Require RS vs benchmark", group=grpRS,
+     tooltip="Покупаем только тикеры, обгоняющие бенчмарк, шортим отстающих. " +
+     "Это momentum factor (Jegadeesh-Titman) — один из самых устойчивых в истории.")
+benchSym = input.symbol("SPY", "Benchmark", group=grpRS)
+rsLook   = input.int(63, "RS lookback (HTF bars)", group=grpRS,
+     tooltip="63 дневных бара ≈ 3 мес — классический momentum-лукбэк. На 4H берите 250-350.")
+rsEdge   = input.float(0.0, "Min RS advantage (%)", group=grpRS, step=0.5,
+     tooltip="На сколько % тикер должен обгонять бенчмарк за период. 0 = просто опережает.")
+useRegime = input.bool(true, "Require benchmark > SMA200 for longs", group=grpRS,
+     tooltip="Macro regime: лонги только при бычьем рынке в целом (SPY выше 200-дневной).")
+
+// ─── Inputs: Chandelier Exit (ATR trailing) ──────────────────────────────
+grpChand   = "Chandelier Trailing Stop"
+useChand   = input.bool(true, "Use chandelier exit", group=grpChand,
+     tooltip="Трейлинг-стоп, который подтягивается за максимумом (для лонга) / минимумом (для шорта) " +
+     "на расстоянии ATR × множитель. Даёт тренду развиться, автоматически фиксирует прибыль.")
+chandLen   = input.int(22, "Chandelier lookback", group=grpChand,
+     tooltip="Сколько баров назад искать экстремум. 22 ≈ месяц торговли.")
+chandMult  = input.float(3.0, "Chandelier ATR ×", group=grpChand, step=0.5,
+     tooltip="Шире = свободы для тренда, уже = быстрее фиксация.")
 
 // ─── Inputs: Calculator ───────────────────────────────────────────────────
 grpCalc  = "Position Calculator"
 equity   = input.float(10000.0, "Account equity ($)", group=grpCalc, minval=1)
 riskPct  = input.float(1.0,     "Risk per trade (%)", group=grpCalc, minval=0.1, maxval=5, step=0.1)
-feePct   = input.float(0.1,     "Fee + slippage (%)", group=grpCalc, minval=0, step=0.05,
-     tooltip="Суммарные комиссии и проскальзывание на круг. У большинства брокеров 0.05-0.2%.")
-tp1R     = input.float(1.0, "TP1 (R multiple)", group=grpCalc, step=0.5)
-tp2R     = input.float(2.0, "TP2 (R multiple)", group=grpCalc, step=0.5)
-tp3R     = input.float(3.0, "TP3 (R multiple)", group=grpCalc, step=0.5)
-showCalc = input.bool(true,  "Show calculator panel", group=grpCalc)
+feePct   = input.float(0.1,     "Fee + slippage (%)", group=grpCalc, minval=0, step=0.05)
+tp1R     = input.float(1.0, "TP1 (R multiple, 1/3 out)", group=grpCalc, step=0.5)
+tp2R     = input.float(2.0, "TP2 (R multiple, 1/3 out, SL→BE)", group=grpCalc, step=0.5)
+showCalc = input.bool(true, "Show calculator panel", group=grpCalc)
 
 // ─── Inputs: Visual ───────────────────────────────────────────────────────
 grpVisual = "Visual"
@@ -74,92 +75,138 @@ showBg    = input.bool(true, "Background tint",   group=grpVisual)
 showMAs   = input.bool(true, "Show SMA200 & EMA50", group=grpVisual)
 showLvls  = input.bool(true, "Show entry/stop/TP lines", group=grpVisual)
 
-// ─── HTF data ─────────────────────────────────────────────────────────────
+// ─── HTF data (ticker) ────────────────────────────────────────────────────
 htf = tfMode == "Daily" ? "D" : "240"
 
 f_macd() =>
     [m, s, h] = ta.macd(close, fastLen, slowLen, sigLen)
     [m, s, h]
+f_perf(len) => close / close[len] - 1
 
 [macdLine, signalLine, hist] = request.security(syminfo.tickerid, htf, f_macd(),
      lookahead=barmerge.lookahead_off)
-ema50   = request.security(syminfo.tickerid, htf, ta.ema(close, emaLen),  lookahead=barmerge.lookahead_off)
-sma200  = request.security(syminfo.tickerid, htf, ta.sma(close, trendLen), lookahead=barmerge.lookahead_off)
-rsiHtf  = request.security(syminfo.tickerid, htf, ta.rsi(close, rsiLen),   lookahead=barmerge.lookahead_off)
-volMa   = request.security(syminfo.tickerid, htf, ta.sma(volume, volLen),  lookahead=barmerge.lookahead_off)
-volHtf  = request.security(syminfo.tickerid, htf, volume,                  lookahead=barmerge.lookahead_off)
-cHtf    = request.security(syminfo.tickerid, htf, close,                   lookahead=barmerge.lookahead_off)
+ema50   = request.security(syminfo.tickerid, htf, ta.ema(close, emaLen),    lookahead=barmerge.lookahead_off)
+sma200  = request.security(syminfo.tickerid, htf, ta.sma(close, trendLen),  lookahead=barmerge.lookahead_off)
+rsiHtf  = request.security(syminfo.tickerid, htf, ta.rsi(close, rsiLen),    lookahead=barmerge.lookahead_off)
+volMa   = request.security(syminfo.tickerid, htf, ta.sma(volume, volLen),   lookahead=barmerge.lookahead_off)
+volHtf  = request.security(syminfo.tickerid, htf, volume,                   lookahead=barmerge.lookahead_off)
+cHtf    = request.security(syminfo.tickerid, htf, close,                    lookahead=barmerge.lookahead_off)
+tkrPerf = request.security(syminfo.tickerid, htf, f_perf(rsLook),           lookahead=barmerge.lookahead_off)
+
+// ─── HTF data (benchmark) ─────────────────────────────────────────────────
+benchClose = request.security(benchSym, htf, close,                         lookahead=barmerge.lookahead_off)
+benchSma   = request.security(benchSym, htf, ta.sma(close, trendLen),       lookahead=barmerge.lookahead_off)
+benchPerf  = request.security(benchSym, htf, f_perf(rsLook),                lookahead=barmerge.lookahead_off)
+
+// ─── Relative Strength ────────────────────────────────────────────────────
+rsAdv     = (tkrPerf - benchPerf) * 100   // преимущество в процентных пунктах
+rsOkLong  = not useRS or rsAdv >=  rsEdge
+rsOkShort = not useRS or rsAdv <= -rsEdge
+benchBull = benchClose > benchSma
+benchBear = benchClose < benchSma
+regimeOkLong  = not useRegime or benchBull
+regimeOkShort = not useRegime or benchBear
 
 // ─── Signal logic ─────────────────────────────────────────────────────────
 bullTrend = cHtf > sma200
 bearTrend = cHtf < sma200
 
-// LONG — два варианта входа:
-//  A) momentum breakout — MACD пересекает 0 снизу вверх
-//  B) pullback — MACD > 0, цена откатилась к EMA50 и гистограмма снова растёт
-macdCrossUp = ta.crossover(macdLine, 0)
-nearEma50   = cHtf >= ema50 * 0.99 and cHtf <= ema50 * 1.02
-pullbackBuy = macdLine > 0 and nearEma50 and macdLine > signalLine and hist > hist[1]
-
-// SHORT — симметрично:
-//  A) momentum breakdown — MACD пересекает 0 сверху вниз
-//  B) pullback — MACD < 0, цена подтянулась к EMA50 и гистограмма снова падает
+macdCrossUp   = ta.crossover(macdLine, 0)
 macdCrossDn   = ta.crossunder(macdLine, 0)
+nearEma50     = cHtf >= ema50 * 0.98 and cHtf <= ema50 * 1.02
+pullbackBuy   = macdLine > 0 and nearEma50 and macdLine > signalLine and hist > hist[1]
 pullbackShort = macdLine < 0 and nearEma50 and macdLine < signalLine and hist < hist[1]
 
-volOk = volHtf >= volMa * volMult
+volOk      = volHtf >= volMa * volMult
 rsiLongOk  = rsiHtf < rsiMax
 rsiShortOk = rsiHtf > (100 - rsiMax)
 
-longSignal  = bullTrend and (macdCrossUp or pullbackBuy)   and volOk and rsiLongOk
-shortSignal = allowShort and bearTrend and (macdCrossDn or pullbackShort) and volOk and rsiShortOk
+longSignal  = bullTrend  and (macdCrossUp or pullbackBuy)   and volOk and rsiLongOk  and rsOkLong  and regimeOkLong
+shortSignal = allowShort and bearTrend and (macdCrossDn or pullbackShort) and volOk and rsiShortOk and rsOkShort and regimeOkShort
 
-// State machine: 1 = long, -1 = short, 0 = flat
-var int state = 0
-if longSignal
-    state := 1
-else if shortSignal
-    state := -1
+// ─── Position sizing (на основе initial stop) ─────────────────────────────
+atrVal       = ta.atr(atrLen)
+stopDist     = atrMult * atrVal
+entryPx      = close
+longStop0    = entryPx - stopDist
+shortStop0   = entryPx + stopDist
 
-// Выход: Trend — только по развороту SMA200, Strict — по MACD или SMA200
-longExit  = exitMode == "Trend" ? cHtf < sma200 : (macdLine < 0 or cHtf < sma200)
-shortExit = exitMode == "Trend" ? cHtf > sma200 : (macdLine > 0 or cHtf > sma200)
+riskUsd      = equity * riskPct / 100.0
+feePerShare  = entryPx * feePct / 100.0 * 2
+riskPerShare = stopDist + feePerShare
+shares       = riskPerShare > 0 ? math.floor(riskUsd / riskPerShare) : 0
+notional     = shares * entryPx
+if notional > equity
+    shares   := math.floor(equity / entryPx)
+    notional := shares * entryPx
+
+longTP1  = entryPx + stopDist * tp1R
+longTP2  = entryPx + stopDist * tp2R
+shortTP1 = entryPx - stopDist * tp1R
+shortTP2 = entryPx - stopDist * tp2R
+
+// ─── Chandelier levels (сырые, считаются всегда) ──────────────────────────
+chandLong  = ta.highest(high, chandLen) - chandMult * atrVal
+chandShort = ta.lowest(low,  chandLen) + chandMult * atrVal
+
+// ─── State machine + trailing stop ────────────────────────────────────────
+var int   state     = 0
+var float trailStop = na
+
+// 1) Входы (на основе сигналов этого бара)
+if longSignal and state != 1
+    state     := 1
+    trailStop := longStop0
+else if shortSignal and state != -1
+    state     := -1
+    trailStop := shortStop0
+
+// 2) Храним трейлинг (только в сторону позиции — ratchet)
+if state == 1 and state[1] == 1 and useChand
+    trailStop := math.max(nz(trailStop, longStop0), chandLong)
+if state == -1 and state[1] == -1 and useChand
+    trailStop := math.min(nz(trailStop, shortStop0), chandShort)
+
+// 3) Условия выхода
+trailHitLong  = state ==  1 and not na(trailStop) and close < trailStop
+trailHitShort = state == -1 and not na(trailStop) and close > trailStop
+
+longExit  = exitMode == "Trend" ? (cHtf < sma200 or trailHitLong)
+                                : (cHtf < sma200 or macdLine < 0 or trailHitLong)
+shortExit = exitMode == "Trend" ? (cHtf > sma200 or trailHitShort)
+                                : (cHtf > sma200 or macdLine > 0 or trailHitShort)
+
 if state ==  1 and longExit
-    state := 0
+    state     := 0
+    trailStop := na
 if state == -1 and shortExit
-    state := 0
+    state     := 0
+    trailStop := na
 
 newLong  = state ==  1 and state[1] !=  1
 newShort = state == -1 and state[1] != -1
 flatten  = state ==  0 and state[1] !=  0
 
-// ─── Position calculator ──────────────────────────────────────────────────
-atrVal    = ta.atr(atrLen)
-stopDist  = atrMult * atrVal
+// ─── Active levels (entry / TPs сохраняем от входа) ──────────────────────
+var float lvlEntry = na
+var float lvlTP1   = na
+var float lvlTP2   = na
 
-entryPx   = close
-longStop  = entryPx - stopDist
-shortStop = entryPx + stopDist
+if newLong
+    lvlEntry := entryPx
+    lvlTP1   := longTP1
+    lvlTP2   := longTP2
+if newShort
+    lvlEntry := entryPx
+    lvlTP1   := shortTP1
+    lvlTP2   := shortTP2
+if flatten
+    lvlEntry := na
+    lvlTP1   := na
+    lvlTP2   := na
 
-// Такой стоп в долларах на акцию; риск на сделку в $
-riskUsd   = equity * riskPct / 100.0
-// Учёт комиссии: реальный риск на акцию = стоп + feePct*entry (вход+выход)
-feePerShare = entryPx * feePct / 100.0 * 2
-riskPerShare = stopDist + feePerShare
-shares    = riskPerShare > 0 ? math.floor(riskUsd / riskPerShare) : 0
-notional  = shares * entryPx
-// Ограничение: не больше 100% счёта (cash-аккаунт, без плеча)
-if notional > equity
-    shares   := math.floor(equity / entryPx)
-    notional := shares * entryPx
-
-// Тейк-профиты (1R/2R/3R от стопа)
-longTP1   = entryPx + stopDist * tp1R
-longTP2   = entryPx + stopDist * tp2R
-longTP3   = entryPx + stopDist * tp3R
-shortTP1  = entryPx - stopDist * tp1R
-shortTP2  = entryPx - stopDist * tp2R
-shortTP3  = entryPx - stopDist * tp3R
+// Стоп для отображения — всегда текущий трейлинг
+lvlStop = state != 0 ? trailStop : na
 
 // ─── Plots ────────────────────────────────────────────────────────────────
 plot(showMAs ? sma200 : na, "SMA200 trend", color=color.new(color.orange, 0), linewidth=2)
@@ -175,73 +222,45 @@ plotshape(flatten,  "EXIT",  shape.xcross,    location.absolute,
 bgcolor(showBg and state ==  1 ? color.new(color.green, 92) : na)
 bgcolor(showBg and state == -1 ? color.new(color.red,   92) : na)
 
-// ─── Active levels (entry / stop / TPs) ──────────────────────────────────
-var float lvlEntry = na
-var float lvlStop  = na
-var float lvlTP1   = na
-var float lvlTP2   = na
-var float lvlTP3   = na
-var int   lvlDir   = 0
-
-if newLong
-    lvlEntry := entryPx
-    lvlStop  := longStop
-    lvlTP1   := longTP1
-    lvlTP2   := longTP2
-    lvlTP3   := longTP3
-    lvlDir   := 1
-if newShort
-    lvlEntry := entryPx
-    lvlStop  := shortStop
-    lvlTP1   := shortTP1
-    lvlTP2   := shortTP2
-    lvlTP3   := shortTP3
-    lvlDir   := -1
-if flatten
-    lvlEntry := na
-    lvlStop  := na
-    lvlTP1   := na
-    lvlTP2   := na
-    lvlTP3   := na
-    lvlDir   := 0
-
-plot(showLvls ? lvlEntry : na, "Entry", color=color.new(color.white,  20), style=plot.style_stepline, linewidth=1)
-plot(showLvls ? lvlStop  : na, "Stop",  color=color.new(color.red,    20), style=plot.style_stepline, linewidth=2)
-plot(showLvls ? lvlTP1   : na, "TP1",   color=color.new(color.green,  40), style=plot.style_stepline, linewidth=1)
-plot(showLvls ? lvlTP2   : na, "TP2",   color=color.new(color.green,  20), style=plot.style_stepline, linewidth=1)
-plot(showLvls ? lvlTP3   : na, "TP3",   color=color.new(color.green,   0), style=plot.style_stepline, linewidth=2)
+plot(showLvls ? lvlEntry : na, "Entry",    color=color.new(color.white, 20), style=plot.style_stepline, linewidth=1)
+plot(showLvls ? lvlStop  : na, "Trail SL", color=color.new(color.red,    0), style=plot.style_stepline, linewidth=2)
+plot(showLvls ? lvlTP1   : na, "TP1",      color=color.new(color.green, 40), style=plot.style_stepline, linewidth=1)
+plot(showLvls ? lvlTP2   : na, "TP2",      color=color.new(color.green, 20), style=plot.style_stepline, linewidth=1)
 
 // ─── Alerts ───────────────────────────────────────────────────────────────
 if newLong
     msg = "BUY " + syminfo.ticker + "\n" +
-          "Entry : $" + str.tostring(entryPx, format.mintick) + "\n" +
-          "Stop  : $" + str.tostring(longStop, format.mintick) +
+          "Entry  : $" + str.tostring(entryPx, format.mintick) + "\n" +
+          "Init SL: $" + str.tostring(longStop0, format.mintick) +
           " (-$" + str.tostring(stopDist, "#.##") + ")\n" +
-          "TP1   : $" + str.tostring(longTP1, format.mintick) + " (1R, закрыть 1/3)\n" +
-          "TP2   : $" + str.tostring(longTP2, format.mintick) + " (2R, закрыть 1/3, стоп в БУ)\n" +
-          "TP3   : $" + str.tostring(longTP3, format.mintick) + " (3R, трейлинг)\n" +
-          "Shares: " + str.tostring(shares) +
+          "TP1    : $" + str.tostring(longTP1, format.mintick) + " (1/3 out)\n" +
+          "TP2    : $" + str.tostring(longTP2, format.mintick) + " (1/3 out, SL→BE)\n" +
+          "Runner : trailing chandelier ATR×" + str.tostring(chandMult) + "\n" +
+          "RS adv : " + str.tostring(rsAdv, "#.#") + " pp\n" +
+          "Shares : " + str.tostring(shares) +
           " ($" + str.tostring(notional, "#.##") + ")"
     alert(msg, alert.freq_once_per_bar_close)
 
 if newShort
     msg = "SHORT " + syminfo.ticker + "\n" +
-          "Entry : $" + str.tostring(entryPx, format.mintick) + "\n" +
-          "Stop  : $" + str.tostring(shortStop, format.mintick) +
+          "Entry  : $" + str.tostring(entryPx, format.mintick) + "\n" +
+          "Init SL: $" + str.tostring(shortStop0, format.mintick) +
           " (+$" + str.tostring(stopDist, "#.##") + ")\n" +
-          "TP1   : $" + str.tostring(shortTP1, format.mintick) + " (1R, закрыть 1/3)\n" +
-          "TP2   : $" + str.tostring(shortTP2, format.mintick) + " (2R, закрыть 1/3, стоп в БУ)\n" +
-          "TP3   : $" + str.tostring(shortTP3, format.mintick) + " (3R, трейлинг)\n" +
-          "Shares: " + str.tostring(shares) +
+          "TP1    : $" + str.tostring(shortTP1, format.mintick) + " (1/3 out)\n" +
+          "TP2    : $" + str.tostring(shortTP2, format.mintick) + " (1/3 out, SL→BE)\n" +
+          "Runner : trailing chandelier ATR×" + str.tostring(chandMult) + "\n" +
+          "RS adv : " + str.tostring(rsAdv, "#.#") + " pp\n" +
+          "Shares : " + str.tostring(shares) +
           " ($" + str.tostring(notional, "#.##") + ")"
     alert(msg, alert.freq_once_per_bar_close)
 
 if flatten
-    alert("EXIT " + syminfo.ticker + " — закрыть позицию", alert.freq_once_per_bar_close)
+    alert("EXIT " + syminfo.ticker + " — закрыть позицию (trail hit / trend flip)",
+         alert.freq_once_per_bar_close)
 
 // ─── Info panel ───────────────────────────────────────────────────────────
 if showCalc
-    var table panel = table.new(position.top_right, 2, 16,
+    var table panel = table.new(position.top_right, 2, 18,
          bgcolor=color.new(color.black, 15), border_width=1, border_color=color.new(color.gray, 60))
 
     headerBg = state == 1 ? color.new(color.green, 30) : state == -1 ? color.new(color.red, 30) : color.new(color.gray, 30)
@@ -249,70 +268,76 @@ if showCalc
 
     if barstate.islast
         table.cell(panel, 0, 0, "Stock Trend " + tfMode, text_color=color.white, bgcolor=headerBg, text_size=size.normal)
-        table.cell(panel, 1, 0, dirText,                  text_color=color.white, bgcolor=headerBg, text_size=size.normal)
+        table.cell(panel, 1, 0, dirText, text_color=color.white, bgcolor=headerBg, text_size=size.normal)
 
-        // Context
-        table.cell(panel, 0, 1, "Trend vs SMA200", text_color=color.silver, text_size=size.small)
+        table.cell(panel, 0, 1, "Ticker vs SMA200", text_color=color.silver, text_size=size.small)
         table.cell(panel, 1, 1, bullTrend ? "BULL" : "BEAR",
              text_color = bullTrend ? color.green : color.red, text_size=size.small)
 
-        table.cell(panel, 0, 2, "MACD", text_color=color.silver, text_size=size.small)
-        table.cell(panel, 1, 2, str.tostring(macdLine, "#.###"),
+        table.cell(panel, 0, 2, "Market (SPY regime)", text_color=color.silver, text_size=size.small)
+        table.cell(panel, 1, 2, benchBull ? "BULL" : "BEAR",
+             text_color = benchBull ? color.green : color.red, text_size=size.small)
+
+        table.cell(panel, 0, 3, "RS vs bench", text_color=color.silver, text_size=size.small)
+        rsColor = rsAdv > 0 ? color.green : color.red
+        table.cell(panel, 1, 3, str.tostring(rsAdv, "+#.#;-#.#") + " pp",
+             text_color=rsColor, text_size=size.small)
+
+        table.cell(panel, 0, 4, "MACD", text_color=color.silver, text_size=size.small)
+        table.cell(panel, 1, 4, str.tostring(macdLine, "#.###"),
              text_color = macdLine > 0 ? color.green : color.red, text_size=size.small)
 
-        table.cell(panel, 0, 3, "RSI(14)", text_color=color.silver, text_size=size.small)
+        table.cell(panel, 0, 5, "RSI(14)", text_color=color.silver, text_size=size.small)
         rsiColor = rsiHtf >= rsiMax ? color.red : rsiHtf <= 30 ? color.orange : color.white
-        table.cell(panel, 1, 3, str.tostring(rsiHtf, "#.#"), text_color=rsiColor, text_size=size.small)
+        table.cell(panel, 1, 5, str.tostring(rsiHtf, "#.#"), text_color=rsiColor, text_size=size.small)
 
-        table.cell(panel, 0, 4, "Volume / MA", text_color=color.silver, text_size=size.small)
-        table.cell(panel, 1, 4, str.tostring(volHtf / volMa, "#.##") + "x",
+        table.cell(panel, 0, 6, "Volume / MA", text_color=color.silver, text_size=size.small)
+        table.cell(panel, 1, 6, str.tostring(volHtf / volMa, "#.##") + "x",
              text_color = volOk ? color.green : color.gray, text_size=size.small)
 
-        table.cell(panel, 0, 5, "─ Trade plan ─", text_color=color.yellow, text_size=size.small)
-        table.cell(panel, 1, 5, "",                 text_color=color.yellow, text_size=size.small)
+        table.cell(panel, 0, 7, "─ Trade plan ─", text_color=color.yellow, text_size=size.small)
+        table.cell(panel, 1, 7, "", text_color=color.yellow, text_size=size.small)
 
-        table.cell(panel, 0, 6, "Entry", text_color=color.silver, text_size=size.small)
-        table.cell(panel, 1, 6, "$" + str.tostring(entryPx, format.mintick),
+        table.cell(panel, 0, 8, "Entry", text_color=color.silver, text_size=size.small)
+        table.cell(panel, 1, 8, state == 0 ? "—" : "$" + str.tostring(lvlEntry, format.mintick),
              text_color=color.white, text_size=size.small)
 
-        slPx = state == 1 ? longStop : state == -1 ? shortStop : na
-        slText = na(slPx) ? "—" : "$" + str.tostring(slPx, format.mintick)
-        table.cell(panel, 0, 7, "Stop-loss", text_color=color.silver, text_size=size.small)
-        table.cell(panel, 1, 7, slText, text_color=color.new(color.red, 0), text_size=size.small)
+        table.cell(panel, 0, 9, "Trail stop", text_color=color.silver, text_size=size.small)
+        table.cell(panel, 1, 9, na(lvlStop) ? "—" : "$" + str.tostring(lvlStop, format.mintick),
+             text_color=color.new(color.red, 0), text_size=size.small)
 
-        tp1Px = state == 1 ? longTP1 : state == -1 ? shortTP1 : na
-        tp2Px = state == 1 ? longTP2 : state == -1 ? shortTP2 : na
-        tp3Px = state == 1 ? longTP3 : state == -1 ? shortTP3 : na
-        table.cell(panel, 0, 8, "TP1 (" + str.tostring(tp1R, "#.#") + "R)",
+        tp1Show = state == 0 ? na : lvlTP1
+        tp2Show = state == 0 ? na : lvlTP2
+        table.cell(panel, 0, 10, "TP1 (" + str.tostring(tp1R, "#.#") + "R)",
              text_color=color.silver, text_size=size.small)
-        table.cell(panel, 1, 8, na(tp1Px) ? "—" : "$" + str.tostring(tp1Px, format.mintick),
+        table.cell(panel, 1, 10, na(tp1Show) ? "—" : "$" + str.tostring(tp1Show, format.mintick),
              text_color=color.green, text_size=size.small)
-        table.cell(panel, 0, 9, "TP2 (" + str.tostring(tp2R, "#.#") + "R)",
+        table.cell(panel, 0, 11, "TP2 (" + str.tostring(tp2R, "#.#") + "R)",
              text_color=color.silver, text_size=size.small)
-        table.cell(panel, 1, 9, na(tp2Px) ? "—" : "$" + str.tostring(tp2Px, format.mintick),
-             text_color=color.green, text_size=size.small)
-        table.cell(panel, 0, 10, "TP3 (" + str.tostring(tp3R, "#.#") + "R)",
-             text_color=color.silver, text_size=size.small)
-        table.cell(panel, 1, 10, na(tp3Px) ? "—" : "$" + str.tostring(tp3Px, format.mintick),
+        table.cell(panel, 1, 11, na(tp2Show) ? "—" : "$" + str.tostring(tp2Show, format.mintick),
              text_color=color.green, text_size=size.small)
 
-        table.cell(panel, 0, 11, "─ Size ─", text_color=color.yellow, text_size=size.small)
-        table.cell(panel, 1, 11, "",            text_color=color.yellow, text_size=size.small)
+        table.cell(panel, 0, 12, "Runner", text_color=color.silver, text_size=size.small)
+        table.cell(panel, 1, 12, useChand ? "chandelier" : "none",
+             text_color=color.white, text_size=size.small)
 
-        table.cell(panel, 0, 12, "Shares", text_color=color.silver, text_size=size.small)
-        table.cell(panel, 1, 12, str.tostring(shares), text_color=color.white, text_size=size.small)
+        table.cell(panel, 0, 13, "─ Size ─", text_color=color.yellow, text_size=size.small)
+        table.cell(panel, 1, 13, "", text_color=color.yellow, text_size=size.small)
 
-        table.cell(panel, 0, 13, "Notional", text_color=color.silver, text_size=size.small)
+        table.cell(panel, 0, 14, "Shares", text_color=color.silver, text_size=size.small)
+        table.cell(panel, 1, 14, str.tostring(shares), text_color=color.white, text_size=size.small)
+
         pctOfEq = equity > 0 ? notional / equity * 100 : 0
-        table.cell(panel, 1, 13, "$" + str.tostring(notional, "#.##") +
+        table.cell(panel, 0, 15, "Notional", text_color=color.silver, text_size=size.small)
+        table.cell(panel, 1, 15, "$" + str.tostring(notional, "#.##") +
              " (" + str.tostring(pctOfEq, "#.#") + "%)",
              text_color=color.white, text_size=size.small)
 
-        table.cell(panel, 0, 14, "Risk",  text_color=color.silver, text_size=size.small)
-        table.cell(panel, 1, 14, "$" + str.tostring(shares * riskPerShare, "#.##") +
+        table.cell(panel, 0, 16, "Risk", text_color=color.silver, text_size=size.small)
+        table.cell(panel, 1, 16, "$" + str.tostring(shares * riskPerShare, "#.##") +
              " (" + str.tostring(riskPct, "#.#") + "%)",
              text_color=color.orange, text_size=size.small)
 
-        table.cell(panel, 0, 15, "Equity", text_color=color.silver, text_size=size.small)
-        table.cell(panel, 1, 15, "$" + str.tostring(equity, "#.##"),
+        table.cell(panel, 0, 17, "Equity", text_color=color.silver, text_size=size.small)
+        table.cell(panel, 1, 17, "$" + str.tostring(equity, "#.##"),
              text_color=color.white, text_size=size.small)
